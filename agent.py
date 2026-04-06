@@ -1,9 +1,7 @@
 import os
 import time
 import requests
-import pandas as pd
 from datetime import datetime, timezone
-from typing import Optional
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -16,6 +14,7 @@ SYMBOL          = "XAU/USD"
 CHECK_INTERVAL  = 300
 BLACKOUT_HOURS  = [(7, 30, 8, 30), (12, 30, 13, 30)]
 
+# ── Telegram ────────────────────────────────────────────────────
 def send_telegram(msg):
     url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN)
     try:
@@ -23,6 +22,7 @@ def send_telegram(msg):
     except Exception as e:
         logger.error("Telegram error: {}".format(e))
 
+# ── Blackout ─────────────────────────────────────────────────────
 def is_blackout():
     now   = datetime.now(timezone.utc)
     total = now.hour * 60 + now.minute
@@ -31,7 +31,9 @@ def is_blackout():
             return True
     return False
 
+# ── Data fetching ────────────────────────────────────────────────
 def get_candles(interval, outputsize=100):
+    """Returns list of dicts: [{open, high, low, close, datetime}, ...]"""
     params = {
         "symbol": SYMBOL, "interval": interval,
         "outputsize": outputsize, "apikey": TWELVE_DATA_KEY, "timezone": "UTC",
@@ -40,60 +42,79 @@ def get_candles(interval, outputsize=100):
         r    = requests.get("https://api.twelvedata.com/time_series", params=params, timeout=15)
         data = r.json()
         if "values" not in data:
-            logger.warning("Twelve Data error ({}): {}".format(interval, data))
+            logger.warning("API error ({}): {}".format(interval, data.get("message", data)))
             return None
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        for col in ["open", "high", "low", "close"]:
-            df[col] = df[col].astype(float)
-        return df.sort_values("datetime").reset_index(drop=True)
+        candles = []
+        for v in reversed(data["values"]):   # oldest first
+            candles.append({
+                "open":  float(v["open"]),
+                "high":  float(v["high"]),
+                "low":   float(v["low"]),
+                "close": float(v["close"]),
+                "dt":    v["datetime"],
+            })
+        return candles
     except Exception as e:
         logger.error("get_candles error: {}".format(e))
         return None
 
-def get_htf_bias(df):
-    highs, lows, n = df["high"].values, df["low"].values, len(df)
+# ── SMC helpers ──────────────────────────────────────────────────
+def get_bias(candles):
+    n = len(candles)
     if n < 10:
         return "neutral"
-    sh = [i for i in range(2, n-2) if highs[i] == max(highs[i-2:i+3])]
-    sl = [i for i in range(2, n-2) if lows[i]  == min(lows[i-2:i+3])]
-    if not sh or not sl:
+    highs = [c["high"] for c in candles]
+    lows  = [c["low"]  for c in candles]
+
+    swing_highs = [i for i in range(2, n-2) if highs[i] == max(highs[i-2:i+3])]
+    swing_lows  = [i for i in range(2, n-2) if lows[i]  == min(lows[i-2:i+3])]
+
+    if not swing_highs or not swing_lows:
         return "neutral"
-    close = df["close"].iloc[-1]
-    if close > highs[sh[-1]]:
+
+    close = candles[-1]["close"]
+    if close > highs[swing_highs[-1]]:
         return "bullish"
-    if close < lows[sl[-1]]:
+    if close < lows[swing_lows[-1]]:
         return "bearish"
     return "neutral"
 
-def find_order_blocks(df, bias):
-    obs, n = [], len(df)
+def find_order_blocks(candles, bias):
+    obs = []
+    n   = len(candles)
     for i in range(3, n - 2):
-        c, nx = df.iloc[i], df.iloc[i+1]
+        c  = candles[i]
+        nx = candles[i + 1]
         if bias == "bullish" and c["close"] < c["open"] and nx["close"] > c["high"]:
             obs.append({"type": "OB_bull", "high": c["high"], "low": c["low"]})
         elif bias == "bearish" and c["close"] > c["open"] and nx["close"] < c["low"]:
             obs.append({"type": "OB_bear", "high": c["high"], "low": c["low"]})
     return obs[-3:]
 
-def find_fvg(df, bias):
-    fvgs, n = [], len(df)
+def find_fvg(candles, bias):
+    fvgs = []
+    n    = len(candles)
     for i in range(1, n - 1):
-        prev, curr, nxt = df.iloc[i-1], df.iloc[i], df.iloc[i+1]
+        prev = candles[i - 1]
+        curr = candles[i]
+        nxt  = candles[i + 1]
         if bias == "bullish" and nxt["low"] > prev["high"]:
             fvgs.append({"type": "FVG_bull", "high": nxt["low"], "low": prev["high"]})
         elif bias == "bearish" and nxt["high"] < prev["low"]:
             fvgs.append({"type": "FVG_bear", "high": prev["low"], "low": nxt["high"]})
     return fvgs[-3:]
 
-def is_engulfing(df, bias):
-    if len(df) < 2:
+def is_engulfing(candles, bias):
+    if len(candles) < 2:
         return False
-    p, c = df.iloc[-2], df.iloc[-1]
+    p = candles[-2]
+    c = candles[-1]
     if bias == "bullish":
-        return p["close"] < p["open"] and c["close"] > c["open"] and c["close"] > p["open"] and c["open"] < p["close"]
+        return (p["close"] < p["open"] and c["close"] > c["open"]
+                and c["close"] > p["open"] and c["open"] < p["close"])
     if bias == "bearish":
-        return p["close"] > p["open"] and c["close"] < c["open"] and c["close"] < p["open"] and c["open"] > p["close"]
+        return (p["close"] > p["open"] and c["close"] < c["open"]
+                and c["close"] < p["open"] and c["open"] > p["close"])
     return False
 
 def price_in_poi(price, poi, buf=0.5):
@@ -108,45 +129,75 @@ def calc_sl_tp(entry, bias, poi):
         tp = round(entry - (sl - entry) * 2, 2)
     return sl, tp
 
+# ── Main analysis ────────────────────────────────────────────────
 def analyze():
-    df4 = get_candles("4h", 50)
-    if df4 is None: return None
-    bias = get_htf_bias(df4)
+    # 1. H4 bias
+    h4 = get_candles("4h", 50)
+    if not h4:
+        return None
+    bias = get_bias(h4)
     logger.info("H4 bias: {}".format(bias))
-    if bias == "neutral": return None
+    if bias == "neutral":
+        return None
 
-    df1 = get_candles("1h", 50)
-    if df1 is None: return None
-    if get_htf_bias(df1) != bias: return None
+    # 2. H1 confirm
+    h1 = get_candles("1h", 50)
+    if not h1:
+        return None
+    if get_bias(h1) != bias:
+        return None
 
-    pois  = find_order_blocks(df1, bias) + find_fvg(df1, bias)
-    if not pois: return None
+    # 3. POIs on H1
+    pois = find_order_blocks(h1, bias) + find_fvg(h1, bias)
+    if not pois:
+        return None
 
-    price = df1["close"].iloc[-1]
-    poi   = next((p for p in reversed(pois) if price_in_poi(price, p)), None)
-    if poi is None: return None
+    price = h1[-1]["close"]
+    logger.info("Price: {} | POIs: {}".format(price, len(pois)))
 
-    df15 = get_candles("15min", 20)
-    if df15 is None: return None
-    if not is_engulfing(df15, bias): return None
+    poi = next((p for p in reversed(pois) if price_in_poi(price, p)), None)
+    if poi is None:
+        return None
+
+    # 4. M15 engulfing confirmation
+    m15 = get_candles("15min", 20)
+    if not m15:
+        return None
+    if not is_engulfing(m15, bias):
+        logger.info("No engulfing on M15")
+        return None
 
     sl, tp = calc_sl_tp(price, bias, poi)
-    return {"bias": bias, "poi_type": poi["type"], "entry": price, "sl": sl, "tp": tp,
-            "time": datetime.now(timezone.utc).strftime("%H:%M UTC")}
+    return {
+        "bias":     bias,
+        "poi_type": poi["type"],
+        "entry":    price,
+        "sl":       sl,
+        "tp":       tp,
+        "time":     datetime.now(timezone.utc).strftime("%H:%M UTC"),
+    }
 
 def format_signal(sig):
-    d = "🟢 LONG" if sig["bias"] == "bullish" else "🔴 SHORT"
-    p = "Order Block" if "OB" in sig["poi_type"] else "Fair Value Gap"
-    return ("*🥇 OROBOT — SEÑAL XAU/USD*\n\n"
-            "*Dirección:* {}\n*POI:* {}\n*Entry:* `{}`\n"
-            "*Stop Loss:* `{}`\n*Take Profit:* `{}`\n*RR:* 1:2\n\n"
-            "_H4+H1 alineados | Envolvente M15_\n🕐 {}"
-            ).format(d, p, sig["entry"], sig["sl"], sig["tp"], sig["time"])
+    direction = "🟢 LONG" if sig["bias"] == "bullish" else "🔴 SHORT"
+    poi_label = "Order Block" if "OB" in sig["poi_type"] else "Fair Value Gap"
+    return (
+        "*🥇 OROBOT — SEÑAL XAU/USD*\n\n"
+        "*Dirección:* {}\n"
+        "*POI:* {}\n"
+        "*Entry:* `{}`\n"
+        "*Stop Loss:* `{}`\n"
+        "*Take Profit:* `{}`\n"
+        "*RR:* 1:2\n\n"
+        "_H4+H1 alineados | Envolvente M15_\n"
+        "🕐 {}"
+    ).format(direction, poi_label, sig["entry"], sig["sl"], sig["tp"], sig["time"])
 
+# ── Loop ─────────────────────────────────────────────────────────
 def main():
     send_telegram("🤖 *Orobot iniciado* — Monitoreando XAU/USD\n_SMC: H4→H1→M15 | OB+FVG | Envolvente_")
     logger.info("Orobot started")
     last_signal = 0
+
     while True:
         try:
             if is_blackout():
